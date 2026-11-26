@@ -1,0 +1,589 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+          unzip -q gradle-8.10.2-bin.zip -d "$HOME"
+          echo "$HOME/gradle-8.10.2/bin" >> "$GITHUB_PATH"
+      - name: Install Android platform
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+      - name: Write project files
+        run: |
+          mkdir -p app/src/main/java/com/dupfinder
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'DupFinder'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.dupfinder'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.dupfinder'
+                  minSdk 30
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <application
+                  android:label="Dupe Finder"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/dupfinder/MainActivity.kt <<'EOF'
+          package com.dupfinder
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ContentUris
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.ImageDecoder
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.util.Size
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.*
+          import java.security.MessageDigest
+          import java.util.concurrent.Executors
+
+          class Fp(val a: Long, val d: Long)
+          class Item(val uri: Uri, val name: String, val size: Long, val w: Int, val h: Int, val mod: Long, val dur: Long, val video: Boolean) {
+              var fp: Fp? = null
+              var fr: List<Fp?>? = null
+          }
+          class Group(val type: String, val items: List<Item>, val note: String, val auto: Boolean)
+          class Run(val n: Int, val a0: Int, val a1: Int, val b0: Int, val b1: Int)
+
+          class MainActivity : Activity() {
+              private lateinit var out: LinearLayout
+              private lateinit var status: TextView
+              private lateinit var bar: ProgressBar
+              private val checks = ArrayList<Pair<CheckBox, Item>>()
+              private val thumbs = Executors.newFixedThreadPool(2)
+              @Volatile private var busy = false
+
+              private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  val sv = ScrollView(this)
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(16), dp(24), dp(16), dp(24))
+                  sv.addView(col)
+                  setContentView(sv)
+                  val title = TextView(this)
+                  title.text = "Dupe Finder"
+                  title.textSize = 24f
+                  col.addView(title)
+                  val sub = TextView(this)
+                  sub.text = "Everything stays on your phone. Selected items go to the trash first. Keep this app open while scanning."
+                  col.addView(sub)
+                  col.addView(btn("Scan photos") { start { scanPhotos() } })
+                  col.addView(btn("Scan videos (exact copies)") { start { scanVideos(false) } })
+                  col.addView(btn("Scan videos (find shared footage)") { start { scanVideos(true) } })
+                  status = TextView(this)
+                  status.text = "Tap a button to start."
+                  col.addView(status)
+                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  col.addView(bar)
+                  out = LinearLayout(this)
+                  out.orientation = LinearLayout.VERTICAL
+                  col.addView(out)
+              }
+
+              private fun btn(label: String, f: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.setOnClickListener { f() }
+                  return b
+              }
+
+              private fun start(job: () -> Unit) {
+                  if (busy) return
+                  busy = true
+                  runOnUiThread { out.removeAllViews(); checks.clear() }
+                  Thread {
+                      try {
+                          job()
+                      } catch (e: Throwable) {
+                          runOnUiThread { status.text = "Error: " + e }
+                      }
+                      busy = false
+                  }.start()
+              }
+
+              private fun prog(d: Int, t: Int, msg: String) {
+                  runOnUiThread {
+                      bar.max = if (t < 1) 1 else t
+                      bar.progress = d
+                      status.text = msg
+                  }
+              }
+
+              private fun perm(): Boolean {
+                  val p = if (Build.VERSION.SDK_INT >= 33)
+                      arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+                  else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+                  if (p.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) return true
+                  runOnUiThread {
+                      requestPermissions(p, 7)
+                      status.text = "Allow access to all photos and videos, then tap the scan button again."
+                  }
+                  return false
+              }
+
+              private fun query(video: Boolean): List<Item> {
+                  val base = if (video) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                  val cols = ArrayList<String>()
+                  cols.add(MediaStore.MediaColumns._ID)
+                  cols.add(MediaStore.MediaColumns.DISPLAY_NAME)
+                  cols.add(MediaStore.MediaColumns.SIZE)
+                  cols.add(MediaStore.MediaColumns.WIDTH)
+                  cols.add(MediaStore.MediaColumns.HEIGHT)
+                  cols.add(MediaStore.MediaColumns.DATE_MODIFIED)
+                  if (video) cols.add(MediaStore.MediaColumns.DURATION)
+                  val res = ArrayList<Item>()
+                  val c = contentResolver.query(base, cols.toTypedArray(), null, null, null)
+                  if (c != null) {
+                      c.use {
+                          while (it.moveToNext()) {
+                              val id = it.getLong(0)
+                              val dur = if (video) it.getLong(6) else 0L
+                              res.add(Item(ContentUris.withAppendedId(base, id), it.getString(1) ?: "?", it.getLong(2), it.getInt(3), it.getInt(4), it.getLong(5), dur, video))
+                          }
+                      }
+                  }
+                  return res
+              }
+
+              private fun sha(u: Uri): String? {
+                  try {
+                      val md = MessageDigest.getInstance("SHA-256")
+                      val buf = ByteArray(1 shl 20)
+                      val ins = contentResolver.openInputStream(u) ?: return null
+                      ins.use { s ->
+                          while (true) {
+                              val n = s.read(buf)
+                              if (n < 0) break
+                              md.update(buf, 0, n)
+                          }
+                      }
+                      return md.digest().joinToString("") { b -> String.format("%02x", b) }
+                  } catch (e: Throwable) {
+                      return null
+                  }
+              }
+
+              private fun hashBmp(b0: Bitmap, skipFlat: Boolean): Fp? {
+                  val b = if (b0.width == 64 && b0.height == 64) b0 else Bitmap.createScaledBitmap(b0, 64, 64, true)
+                  val px = IntArray(4096)
+                  b.getPixels(px, 0, 64, 0, 0, 64, 64)
+                  val g = FloatArray(4096)
+                  var mn = 255f
+                  var mx = 0f
+                  for (i in 0 until 4096) {
+                      val p = px[i]
+                      val al = Color.alpha(p) / 255f
+                      val r = Color.red(p) * al + 255f * (1f - al)
+                      val gg = Color.green(p) * al + 255f * (1f - al)
+                      val bb = Color.blue(p) * al + 255f * (1f - al)
+                      val v = 0.299f * r + 0.587f * gg + 0.114f * bb
+                      g[i] = v
+                      if (v < mn) mn = v
+                      if (v > mx) mx = v
+                  }
+                  if (skipFlat && mx - mn < 12f) return null
+                  val blk = FloatArray(64)
+                  var sum = 0f
+                  for (by in 0 until 8) for (bx in 0 until 8) {
+                      var s = 0f
+                      for (yy in 0 until 8) for (xx in 0 until 8) s += g[(by * 8 + yy) * 64 + bx * 8 + xx]
+                      blk[by * 8 + bx] = s / 64f
+                      sum += s / 64f
+                  }
+                  val mean = sum / 64f
+                  var a = 0L
+                  for (i in 0 until 64) if (blk[i] > mean) a = a or (1L shl i)
+                  val gr = FloatArray(72)
+                  for (r in 0 until 8) for (c in 0 until 9) {
+                      val x0 = c * 64 / 9
+                      val x1 = maxOf(x0 + 1, (c + 1) * 64 / 9)
+                      var s = 0f
+                      var n = 0
+                      for (yy in r * 8 until r * 8 + 8) for (xx in x0 until x1) {
+                          s += g[yy * 64 + xx]
+                          n++
+                      }
+                      gr[r * 9 + c] = s / n
+                  }
+                  var d = 0L
+                  var k = 0
+                  for (r in 0 until 8) for (c in 0 until 8) {
+                      if (gr[r * 9 + c] > gr[r * 9 + c + 1]) d = d or (1L shl k)
+                      k++
+                  }
+                  return Fp(a, d)
+              }
+
+              private fun imgFp(m: Item): Fp? {
+                  try {
+                      val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, m.uri)) { dec, _, _ ->
+                          dec.setTargetSize(64, 64)
+                          dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                      }
+                      return hashBmp(bmp, false)
+                  } catch (e: Throwable) {
+                      return null
+                  }
+              }
+
+              private fun vidFrames(m: Item, step: Int, onp: (Double) -> Unit): List<Fp?>? {
+                  val mr = MediaMetadataRetriever()
+                  try {
+                      mr.setDataSource(this, m.uri)
+                      val n = Math.ceil(m.dur / 1000.0 / step).toInt()
+                      val res = ArrayList<Fp?>()
+                      for (k in 0 until n) {
+                          val t = minOf(m.dur * 1000L - 100000L, ((step / 2.0 + k * step) * 1000000.0).toLong())
+                          val bmp = mr.getScaledFrameAtTime(maxOf(0L, t), MediaMetadataRetriever.OPTION_CLOSEST, 64, 64)
+                          res.add(if (bmp == null) null else hashBmp(bmp, true))
+                          if (k % 3 == 0) onp(k.toDouble() / n)
+                      }
+                      return res
+                  } catch (e: Throwable) {
+                      return null
+                  } finally {
+                      try { mr.release() } catch (e: Throwable) {}
+                  }
+              }
+
+              private fun fm(x: Fp?, y: Fp?, t: Int): Boolean {
+                  if (x == null || y == null) return false
+                  return java.lang.Long.bitCount(x.d xor y.d) <= t + 4 && java.lang.Long.bitCount(x.a xor y.a) <= t + 8
+              }
+
+              private fun sharedRun(A: List<Fp?>, B: List<Fp?>, t: Int): Run {
+                  var best = Run(0, 0, 0, 0, 0)
+                  for (off in -(B.size - 1) until A.size) {
+                      var cnt = 0
+                      var gap = 0
+                      var st = 0
+                      var i = maxOf(0, off)
+                      while (i < A.size) {
+                          val j = i - off
+                          if (j >= B.size) break
+                          if (fm(A[i], B[j], t)) {
+                              if (cnt == 0) st = i
+                              cnt++
+                              gap = 0
+                              if (cnt > best.n) best = Run(cnt, st, i, st - off, i - off)
+                          } else {
+                              gap++
+                              if (gap > 1) { cnt = 0; gap = 0 }
+                          }
+                          i++
+                      }
+                  }
+                  return best
+              }
+
+              private fun findExact(items: List<Item>): List<List<Item>> {
+                  val bySize = HashMap<Long, MutableList<Item>>()
+                  for (m in items) if (m.size > 0) bySize.getOrPut(m.size) { ArrayList() }.add(m)
+                  var total = 0
+                  for (g in bySize.values) if (g.size > 1) total += g.size
+                  var done = 0
+                  val byHash = HashMap<String, MutableList<Item>>()
+                  for (g in bySize.values) {
+                      if (g.size < 2) continue
+                      for (m in g) {
+                          val h = sha(m.uri)
+                          if (h != null) byHash.getOrPut(h) { ArrayList() }.add(m)
+                          done++
+                          prog(done, total, "Checking exact copies... $done/$total")
+                      }
+                  }
+                  val res = ArrayList<List<Item>>()
+                  for (g in byHash.values) if (g.size > 1) res.add(g)
+                  return res
+              }
+
+              private fun best(g: List<Item>): Item {
+                  var b = g[0]
+                  for (m in g) {
+                      val pm = m.w.toLong() * m.h
+                      val pb = b.w.toLong() * b.h
+                      if (pm > pb || (pm == pb && (m.size > b.size || (m.size == b.size && m.mod < b.mod)))) b = m
+                  }
+                  return b
+              }
+
+              private fun sameShape(a: Item, b: Item): Boolean {
+                  if (a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0) return true
+                  val ra = maxOf(a.w, a.h).toDouble() / minOf(a.w, a.h)
+                  val rb = maxOf(b.w, b.h).toDouble() / minOf(b.w, b.h)
+                  return Math.abs(ra - rb) / maxOf(ra, rb) <= 0.05
+              }
+
+              private fun scanPhotos() {
+                  if (!perm()) return
+                  val items = query(false)
+                  prog(0, 1, "Found " + items.size + " photos")
+                  val ex = findExact(items)
+                  val twins = HashMap<Item, List<Item>>()
+                  val skip = HashSet<Item>()
+                  for (g in ex) {
+                      twins[g[0]] = g
+                      for (i in 1 until g.size) skip.add(g[i])
+                  }
+                  val reps = items.filter { it !in skip }
+                  var n = 0
+                  for (m in reps) {
+                      m.fp = imgFp(m)
+                      n++
+                      if (n % 10 == 0) prog(n, reps.size, "Comparing photos... $n/" + reps.size)
+                  }
+                  val taken = HashSet<Item>()
+                  val groups = ArrayList<Group>()
+                  val inNear = HashSet<Item>()
+                  for (i in reps.indices) {
+                      val a = reps[i]
+                      val fa = a.fp
+                      if (fa == null || a in taken) continue
+                      val g = ArrayList<Item>()
+                      g.add(a)
+                      for (j in i + 1 until reps.size) {
+                          val b = reps[j]
+                          val fb = b.fp
+                          if (fb != null && b !in taken && sameShape(a, b) &&
+                              java.lang.Long.bitCount(fa.d xor fb.d) <= 5 && java.lang.Long.bitCount(fa.a xor fb.a) <= 9) g.add(b)
+                      }
+                      if (g.size > 1) {
+                          taken.addAll(g)
+                          val full = ArrayList<Item>()
+                          for (m in g) full.addAll(twins[m] ?: listOf(m))
+                          inNear.addAll(full)
+                          groups.add(Group("Look-alike", full, "", true))
+                      }
+                  }
+                  for (g in ex) if (g[0] !in inNear) groups.add(Group("Exact copy", g, "", true))
+                  showGroups(groups)
+              }
+
+              private fun scanVideos(shared: Boolean) {
+                  if (!perm()) return
+                  val items = query(true)
+                  prog(0, 1, "Found " + items.size + " videos")
+                  val ex = findExact(items)
+                  val groups = ArrayList<Group>()
+                  for (g in ex) groups.add(Group("Exact copy", g, "", true))
+                  if (shared) {
+                      val skip = HashSet<Item>()
+                      for (g in ex) for (i in 1 until g.size) skip.add(g[i])
+                      val reps = items.filter { it !in skip && it.dur > 3000 }
+                      if (reps.size > 1) {
+                          var md = 0L
+                          for (m in reps) if (m.dur > md) md = m.dur
+                          val step = maxOf(1, Math.ceil(md / 1000.0 / 600.0).toInt())
+                          var k = 0
+                          for (m in reps) {
+                              k++
+                              val kk = k
+                              m.fr = vidFrames(m, step) { p -> prog(kk - 1, reps.size, "Sampling video $kk/" + reps.size + " (" + (p * 100).toInt() + "%)") }
+                          }
+                          val ok = reps.filter { m -> (m.fr?.count { f -> f != null } ?: 0) >= 3 }
+                          prog(0, 1, "Comparing " + ok.size + " videos...")
+                          for (i in ok.indices) for (j in i + 1 until ok.size) {
+                              var a = ok[i]
+                              var b = ok[j]
+                              if (b.dur > a.dur) { val t = a; a = b; b = t }
+                              val r = sharedRun(a.fr!!, b.fr!!, 5)
+                              val need = maxOf(3, Math.ceil(minOf(20.0, 0.6 * b.dur / 1000.0) / step).toInt())
+                              if (r.n >= need) {
+                                  val e1 = minOf(a.dur / 1000.0, (r.a1 + 1) * step.toDouble())
+                                  val e2 = minOf(b.dur / 1000.0, (r.b1 + 1) * step.toDouble())
+                                  val len = minOf(e1 - r.a0 * step, e2 - r.b0 * step)
+                                  val note = "Matching footage about " + mmss(len) + ". Longer video " + mmss(r.a0 * step.toDouble()) + "-" + mmss(e1) +
+                                      ", shorter video " + mmss(r.b0 * step.toDouble()) + "-" + mmss(e2) + ". Check before trashing."
+                                  groups.add(Group("Shared footage", listOf(a, b), note, false))
+                              }
+                          }
+                      }
+                  }
+                  showGroups(groups)
+              }
+
+              private fun mmss(s: Double): String {
+                  val t = s.toInt()
+                  return String.format("%d:%02d", t / 60, t % 60)
+              }
+
+              private fun describe(m: Item): String {
+                  val sb = StringBuilder(m.name)
+                  sb.append("\n").append(String.format("%.2f MB", m.size / 1048576.0))
+                  if (m.w > 0) sb.append(" - ").append(m.w).append("x").append(m.h)
+                  if (m.video) sb.append(" - ").append(mmss(m.dur / 1000.0))
+                  return sb.toString()
+              }
+
+              private fun showGroups(groups: List<Group>) {
+                  runOnUiThread {
+                      out.removeAllViews()
+                      checks.clear()
+                      bar.progress = bar.max
+                      if (groups.isEmpty()) {
+                          status.text = "Done. No duplicates found."
+                      } else {
+                          status.text = "Done. " + groups.size + " groups found. Untick anything you want to keep."
+                          val del = Button(this)
+                          del.text = "Move selected to trash"
+                          del.setOnClickListener { trashSelected() }
+                          out.addView(del)
+                          var gi = 0
+                          for (g in groups.take(300)) {
+                              gi++
+                              val card = LinearLayout(this)
+                              card.orientation = LinearLayout.VERTICAL
+                              card.setPadding(dp(4), dp(14), dp(4), dp(10))
+                              val h = TextView(this)
+                              h.text = "Group $gi - " + g.type
+                              h.textSize = 17f
+                              card.addView(h)
+                              if (g.note.isNotEmpty()) {
+                                  val nt = TextView(this)
+                                  nt.text = g.note
+                                  card.addView(nt)
+                              }
+                              val keep = if (g.auto) best(g.items) else null
+                              for (m in g.items) {
+                                  val row = LinearLayout(this)
+                                  row.orientation = LinearLayout.HORIZONTAL
+                                  row.setPadding(0, dp(8), 0, dp(8))
+                                  val iv = ImageView(this)
+                                  iv.scaleType = ImageView.ScaleType.CENTER_CROP
+                                  row.addView(iv, LinearLayout.LayoutParams(dp(96), dp(96)))
+                                  val side = LinearLayout(this)
+                                  side.orientation = LinearLayout.VERTICAL
+                                  side.setPadding(dp(10), 0, 0, 0)
+                                  val t = TextView(this)
+                                  t.text = describe(m) + (if (m === keep) "\nSuggested to keep" else "")
+                                  val cb = CheckBox(this)
+                                  cb.text = "Move to trash"
+                                  cb.isChecked = g.auto && m !== keep
+                                  side.addView(t)
+                                  side.addView(cb)
+                                  row.addView(side, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                                  card.addView(row)
+                                  checks.add(Pair(cb, m))
+                                  thumbs.execute {
+                                      try {
+                                          val bm = contentResolver.loadThumbnail(m.uri, Size(192, 192), null)
+                                          runOnUiThread { iv.setImageBitmap(bm) }
+                                      } catch (e: Throwable) {}
+                                  }
+                              }
+                              out.addView(card)
+                          }
+                      }
+                  }
+              }
+
+              private fun trashSelected() {
+                  val uris = ArrayList<Uri>()
+                  for (p in checks) if (p.first.isChecked) uris.add(p.second.uri)
+                  if (uris.isEmpty()) {
+                      Toast.makeText(this, "Nothing selected", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val pi = MediaStore.createTrashRequest(contentResolver, uris, true)
+                  startIntentSenderForResult(pi.intentSender, 42, null, 0, 0, 0)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 42) {
+                      status.text = if (resultCode == RESULT_OK) "Moved to trash. Scan again to refresh the list." else "Cancelled. Nothing was changed."
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon assembleDebug
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "build-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk --title "Build ${{ github.run_number }}" --notes "Debug APK"

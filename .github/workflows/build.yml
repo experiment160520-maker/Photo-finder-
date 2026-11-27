@@ -83,9 +83,11 @@ jobs:
               <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
               <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
               <application
+                  android:allowBackup="false"
                   android:label="Dupe Finder"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
-                  <activity android:name=".MainActivity" android:exported="true">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -101,95 +103,536 @@ jobs:
           import android.app.Activity
           import android.content.ContentUris
           import android.content.Intent
+          import android.content.SharedPreferences
           import android.content.pm.PackageManager
-          import android.graphics.Bitmap
-          import android.graphics.Color
-          import android.graphics.ImageDecoder
+          import android.content.res.ColorStateList
+          import android.content.res.Configuration
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.RippleDrawable
           import android.media.MediaMetadataRetriever
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
+          import android.provider.DocumentsContract
           import android.provider.MediaStore
+          import android.provider.OpenableColumns
           import android.util.Size
-          import android.view.ViewGroup
+          import android.view.Gravity
+          import android.view.View
+          import android.view.WindowInsetsController
           import android.view.WindowManager
           import android.widget.*
           import java.security.MessageDigest
           import java.util.concurrent.Executors
+          import java.util.concurrent.atomic.AtomicInteger
 
           class Fp(val a: Long, val d: Long)
-          class Item(val uri: Uri, val name: String, val size: Long, val w: Int, val h: Int, val mod: Long, val dur: Long, val video: Boolean) {
+          class Item(val uri: Uri, val name: String, val size: Long, var w: Int, var h: Int, val mod: Long, var dur: Long,
+                     val video: Boolean, val mime: String, val mediaUri: Uri?) {
               var fp: Fp? = null
               var fr: List<Fp?>? = null
+              var sha: String? = null
           }
           class Group(val type: String, val items: List<Item>, val note: String, val auto: Boolean)
           class Run(val n: Int, val a0: Int, val a1: Int, val b0: Int, val b1: Int)
+          class Th(val name: String, bgS: String, cardS: String, txS: String, subS: String, acS: String, val dark: Boolean) {
+              val bg = Color.parseColor(bgS)
+              val card = Color.parseColor(cardS)
+              val tx = Color.parseColor(txS)
+              val sub = Color.parseColor(subS)
+              val ac = Color.parseColor(acS)
+          }
 
           class MainActivity : Activity() {
-              private lateinit var out: LinearLayout
-              private lateinit var status: TextView
-              private lateinit var bar: ProgressBar
-              private val checks = ArrayList<Pair<CheckBox, Item>>()
+              private lateinit var prefs: SharedPreferences
+              private lateinit var th: Th
+              private var ac = 0
+              private var screen = 0
+              @Volatile private var scanning = false
+              @Volatile private var cancel = false
+              private var msg = ""
+              private var pct = 0
+              private var pmax = 1
+              private var statusTv: TextView? = null
+              private var barPb: ProgressBar? = null
+              private var sv: ScrollView? = null
+              private var groups: List<Group> = ArrayList()
+              private val sel = HashSet<Item>()
+              private var updSel: (() -> Unit)? = null
               private val thumbs = Executors.newFixedThreadPool(2)
-              @Volatile private var busy = false
+              private val themes = listOf(
+                  Th("Light", "#F4F5F7", "#FFFFFF", "#16181D", "#6B7280", "#3B6CF6", false),
+                  Th("Dark", "#0F1115", "#1A1D24", "#ECEFF4", "#9AA3B2", "#6C9BFF", true),
+                  Th("AMOLED", "#000000", "#111111", "#FFFFFF", "#9A9A9A", "#4CC38A", true),
+                  Th("Ocean", "#08141F", "#0F2335", "#E6F3FF", "#8FB0C9", "#3CC8E8", true),
+                  Th("Forest", "#0C1410", "#14221A", "#E8F5EC", "#93AE9C", "#5FD38D", true),
+                  Th("Sunset", "#1A0F12", "#2A1A1F", "#FFEEE8", "#C9A0A0", "#FF8A5B", true),
+                  Th("Rose", "#FFF5F7", "#FFFFFF", "#2A1A20", "#8A6A74", "#E5457A", false)
+              )
 
+              // ---------- UI helpers ----------
               private fun dp(x: Int): Int = (x * resources.displayMetrics.density).toInt()
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                  val sv = ScrollView(this)
-                  val col = LinearLayout(this)
-                  col.orientation = LinearLayout.VERTICAL
-                  col.setPadding(dp(16), dp(24), dp(16), dp(24))
-                  sv.addView(col)
-                  setContentView(sv)
-                  val title = TextView(this)
-                  title.text = "Dupe Finder"
-                  title.textSize = 24f
-                  col.addView(title)
-                  val sub = TextView(this)
-                  sub.text = "Everything stays on your phone. Selected items go to the trash first. Keep this app open while scanning."
-                  col.addView(sub)
-                  col.addView(btn("Scan photos") { start { scanPhotos() } })
-                  col.addView(btn("Scan videos (exact copies)") { start { scanVideos(false) } })
-                  col.addView(btn("Scan videos (find shared footage)") { start { scanVideos(true) } })
-                  status = TextView(this)
-                  status.text = "Tap a button to start."
-                  col.addView(status)
-                  bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
-                  col.addView(bar)
-                  out = LinearLayout(this)
-                  out.orientation = LinearLayout.VERTICAL
-                  col.addView(out)
+              private fun vbox(): LinearLayout { val l = LinearLayout(this); l.orientation = LinearLayout.VERTICAL; return l }
+              private fun adj(c: Int, a: Float): Int = Color.argb((255 * a).toInt(), Color.red(c), Color.green(c), Color.blue(c))
+              private fun hsv(h: Int): Int = Color.HSVToColor(floatArrayOf(h.toFloat(), 0.62f, if (th.dark) 1f else 0.85f))
+              private fun onAc(): Int = if (Color.red(ac) * 0.299 + Color.green(ac) * 0.587 + Color.blue(ac) * 0.114 > 160) Color.BLACK else Color.WHITE
+              private fun lp(top: Int): LinearLayout.LayoutParams { val l = LinearLayout.LayoutParams(-1, -2); l.topMargin = dp(top); return l }
+              private fun add(p: LinearLayout, v: View, top: Int) { p.addView(v, lp(top)) }
+              private fun toast(s: String) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+              private fun bgd(color: Int, r: Int, stroke: Int): GradientDrawable {
+                  val g = GradientDrawable()
+                  g.setColor(color)
+                  g.cornerRadius = dp(r).toFloat()
+                  if (stroke != 0) g.setStroke(dp(1), stroke)
+                  return g
+              }
+              private fun txt(s: String, size: Float, color: Int, bold: Boolean): TextView {
+                  val t = TextView(this)
+                  t.text = s
+                  t.textSize = size
+                  t.setTextColor(color)
+                  if (bold) t.typeface = Typeface.DEFAULT_BOLD
+                  t.setPadding(0, dp(2), 0, dp(2))
+                  return t
+              }
+              private fun card(parent: LinearLayout): LinearLayout {
+                  val c = vbox()
+                  c.background = bgd(th.card, 20, adj(th.tx, 0.08f))
+                  c.setPadding(dp(16), dp(14), dp(16), dp(16))
+                  parent.addView(c, lp(12))
+                  return c
+              }
+              private fun pill(label: String, filled: Boolean, f: () -> Unit): TextView {
+                  val t = TextView(this)
+                  t.text = label
+                  t.textSize = 15f
+                  t.gravity = Gravity.CENTER
+                  t.typeface = Typeface.DEFAULT_BOLD
+                  t.setTextColor(if (filled) onAc() else ac)
+                  val b = if (filled) bgd(ac, 14, 0) else bgd(Color.TRANSPARENT, 14, ac)
+                  t.background = RippleDrawable(ColorStateList.valueOf(adj(Color.GRAY, 0.35f)), b, null)
+                  t.setPadding(dp(16), dp(12), dp(16), dp(12))
+                  t.setOnClickListener { f() }
+                  return t
+              }
+              private fun swRow(p: LinearLayout, label: String, key: String, def: Boolean, onChange: (() -> Unit)?) {
+                  val r = LinearLayout(this)
+                  r.gravity = Gravity.CENTER_VERTICAL
+                  r.addView(txt(label, 15f, th.tx, false), LinearLayout.LayoutParams(0, -2, 1f))
+                  val s = Switch(this)
+                  s.isChecked = prefs.getBoolean(key, def)
+                  s.trackTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(ac, adj(th.tx, 0.25f)))
+                  s.thumbTintList = ColorStateList.valueOf(Color.WHITE)
+                  s.setOnCheckedChangeListener { _, v ->
+                      prefs.edit().putBoolean(key, v).apply()
+                      if (onChange != null) onChange()
+                  }
+                  r.addView(s)
+                  add(p, r, 6)
+              }
+              private fun chips(p: LinearLayout, label: String, key: String, names: List<String>, vals: List<Int>, def: Int, after: (() -> Unit)?) {
+                  add(p, txt(label, 13f, th.sub, false), 12)
+                  val hs = HorizontalScrollView(this)
+                  hs.isHorizontalScrollBarEnabled = false
+                  val row = LinearLayout(this)
+                  hs.addView(row)
+                  val views = ArrayList<TextView>()
+                  fun paint() {
+                      val cur = prefs.getInt(key, def)
+                      for (i in views.indices) {
+                          val on = vals[i] == cur
+                          views[i].setTextColor(if (on) onAc() else th.tx)
+                          views[i].background = bgd(if (on) ac else adj(th.tx, 0.08f), 12, 0)
+                      }
+                  }
+                  for (i in names.indices) {
+                      val t = TextView(this)
+                      t.text = names[i]
+                      t.textSize = 14f
+                      t.setPadding(dp(14), dp(9), dp(14), dp(9))
+                      t.setOnClickListener {
+                          prefs.edit().putInt(key, vals[i]).apply()
+                          paint()
+                          if (after != null) after()
+                      }
+                      views.add(t)
+                      val l = LinearLayout.LayoutParams(-2, -2)
+                      l.rightMargin = dp(8)
+                      row.addView(t, l)
+                  }
+                  paint()
+                  add(p, hs, 6)
+              }
+              private fun pickTheme(): Th {
+                  val i = prefs.getInt("theme", 0)
+                  if (i > 0 && i <= themes.size) return themes[i - 1]
+                  val night = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+                  return if (night) themes[1] else themes[0]
               }
 
-              private fun btn(label: String, f: () -> Unit): Button {
-                  val b = Button(this)
-                  b.text = label
-                  b.setOnClickListener { f() }
+              // ---------- lifecycle ----------
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("dupe", MODE_PRIVATE)
+                  render(false)
+              }
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  if (prefs.getInt("theme", 0) == 0) render(true)
+              }
+              @Suppress("DEPRECATION")
+              override fun onBackPressed() {
+                  if (screen != 0) { screen = 0; render(false) } else super.onBackPressed()
+              }
+
+              private fun render(keep: Boolean) {
+                  th = pickTheme()
+                  val h = prefs.getInt("hue", -1)
+                  ac = if (h < 0) th.ac else hsv(h)
+                  window.statusBarColor = th.bg
+                  window.navigationBarColor = th.bg
+                  val ctl = window.insetsController
+                  if (ctl != null) {
+                      val m = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                      ctl.setSystemBarsAppearance(if (th.dark) 0 else m, m)
+                  }
+                  if (prefs.getBoolean("secure", false)) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                  else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                  val y = if (keep) (sv?.scrollY ?: 0) else 0
+                  val s = ScrollView(this)
+                  s.setBackgroundColor(th.bg)
+                  val col = vbox()
+                  col.setPadding(dp(18), dp(24), dp(18), dp(40))
+                  s.addView(col)
+                  sv = s
+                  statusTv = null
+                  barPb = null
+                  updSel = null
+                  when (screen) {
+                      0 -> home(col)
+                      1 -> settings(col)
+                      else -> results(col)
+                  }
+                  setContentView(s)
+                  s.post { s.scrollTo(0, y) }
+              }
+
+              // ---------- screens ----------
+              private fun home(col: LinearLayout) {
+                  col.addView(txt("Dupe Finder", 32f, th.tx, true))
+                  col.addView(txt("Find duplicate photos and videos. Everything stays on your phone, and this app has no internet access.", 14f, th.sub, false))
+                  if (scanning) {
+                      val c = card(col)
+                      c.addView(txt("Scanning", 18f, th.tx, true))
+                      val st = txt(msg, 14f, th.sub, false)
+                      c.addView(st)
+                      statusTv = st
+                      val b = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                      b.progressTintList = ColorStateList.valueOf(ac)
+                      b.max = pmax
+                      b.progress = pct
+                      add(c, b, 10)
+                      barPb = b
+                      add(c, pill("Cancel", false) { cancel = true; msg = "Cancelling..." }, 12)
+                      return
+                  }
+                  if (msg.isNotEmpty()) {
+                      val c = card(col)
+                      c.addView(txt(msg, 14f, th.tx, false))
+                  }
+                  val c1 = card(col)
+                  c1.addView(txt("Scan whole gallery", 18f, th.tx, true))
+                  c1.addView(txt("Checks all photos and videos you give access to, using your settings.", 13f, th.sub, false))
+                  add(c1, pill("Scan gallery", true) { startScan(null) }, 12)
+                  val c2 = card(col)
+                  c2.addView(txt("Pick files to compare", 18f, th.tx, true))
+                  c2.addView(txt("Choose specific photos and videos with Android's own picker. No storage permission needed.", 13f, th.sub, false))
+                  add(c2, pill("Pick photos and videos", true) { pick() }, 12)
+                  if (groups.isNotEmpty()) {
+                      val c3 = card(col)
+                      c3.addView(txt("Last results: " + groups.size + " groups", 16f, th.tx, true))
+                      add(c3, pill("View results", false) { screen = 2; render(false) }, 12)
+                  }
+                  add(col, pill("Settings and themes", false) { screen = 1; render(false) }, 16)
+              }
+
+              private fun settings(col: LinearLayout) {
+                  add(col, pill("Back", false) { screen = 0; render(false) }, 0)
+                  col.addView(txt("Settings", 28f, th.tx, true), lp(10))
+                  val a = card(col)
+                  a.addView(txt("Appearance", 17f, th.tx, true))
+                  val names = ArrayList<String>()
+                  val vals = ArrayList<Int>()
+                  names.add("System"); vals.add(0)
+                  for (i in themes.indices) { names.add(themes[i].name); vals.add(i + 1) }
+                  chips(a, "Theme", "theme", names, vals, 0) { render(true) }
+                  add(a, txt("Accent color", 13f, th.sub, false), 12)
+                  val hs = HorizontalScrollView(this)
+                  hs.isHorizontalScrollBarEnabled = false
+                  val row = LinearLayout(this)
+                  hs.addView(row)
+                  val hues = intArrayOf(-1, 0, 25, 48, 140, 175, 215, 265, 300, 330)
+                  val curHue = prefs.getInt("hue", -1)
+                  for (hh in hues) {
+                      val v = View(this)
+                      val g = GradientDrawable()
+                      g.shape = GradientDrawable.OVAL
+                      g.setColor(if (hh < 0) th.ac else hsv(hh))
+                      if (hh == curHue) g.setStroke(dp(3), th.tx)
+                      v.background = g
+                      v.setOnClickListener { prefs.edit().putInt("hue", hh).apply(); render(true) }
+                      val l = LinearLayout.LayoutParams(dp(38), dp(38))
+                      l.rightMargin = dp(10)
+                      row.addView(v, l)
+                  }
+                  add(a, hs, 8)
+                  val hb = SeekBar(this)
+                  hb.max = 360
+                  hb.progress = maxOf(0, curHue)
+                  hb.progressTintList = ColorStateList.valueOf(ac)
+                  hb.thumbTintList = ColorStateList.valueOf(ac)
+                  hb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {}
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) { prefs.edit().putInt("hue", hb.progress).apply(); render(true) }
+                  })
+                  add(a, txt("Custom hue", 13f, th.sub, false), 8)
+                  add(a, hb, 2)
+
+                  val b = card(col)
+                  b.addView(txt("What to scan", 17f, th.tx, true))
+                  swRow(b, "Photos", "photos", true, null)
+                  swRow(b, "GIFs and animated images", "gif", true, null)
+                  swRow(b, "Videos", "videos", true, null)
+                  chips(b, "Ignore files smaller than", "minkb", listOf("Off", "50 KB", "500 KB", "1 MB"), listOf(0, 50, 500, 1024), 0, null)
+
+                  val c = card(col)
+                  c.addView(txt("How to compare", 17f, th.tx, true))
+                  val sl = txt("", 13f, th.sub, false)
+                  add(c, sl, 10)
+                  val sb = SeekBar(this)
+                  sb.max = 9
+                  sb.progress = prefs.getInt("sens", 5) - 1
+                  sb.progressTintList = ColorStateList.valueOf(ac)
+                  sb.thumbTintList = ColorStateList.valueOf(ac)
+                  sl.text = "Sensitivity " + (sb.progress + 1) + " of 10 (low = near-identical only, high = also catches edits)"
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                          prefs.edit().putInt("sens", p + 1).apply()
+                          sl.text = "Sensitivity " + (p + 1) + " of 10 (low = near-identical only, high = also catches edits)"
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                  add(c, sb, 2)
+                  swRow(c, "Exact copies only (fastest)", "exact", false, null)
+                  swRow(c, "Find shared footage in videos (slower)", "shared", false, null)
+                  chips(c, "Video detail", "vstep", listOf("Fast", "Normal", "Detailed"), listOf(4, 2, 1), 2, null)
+                  chips(c, "Speed", "thr", listOf("Auto", "1 thread", "2 threads", "4 threads"), listOf(0, 1, 2, 4), 0, null)
+                  chips(c, "Pre-select for trash", "keep", listOf("Keep best quality", "Keep oldest", "Keep newest"), listOf(0, 1, 2), 0, null)
+
+                  val d = card(col)
+                  d.addView(txt("Privacy", 17f, th.tx, true))
+                  d.addView(txt("This app has no internet permission, so nothing can leave your phone. It saves only these settings. Files are read only to compare them.", 13f, th.sub, false))
+                  swRow(d, "Privacy screen (hide in recent apps, block screenshots)", "secure", false) { render(true) }
+              }
+
+              private fun saving(g: Group): Long {
+                  var t = 0L
+                  var mx = 0L
+                  for (m in g.items) { t += m.size; if (m.size > mx) mx = m.size }
+                  return t - mx
+              }
+
+              private fun results(col: LinearLayout) {
+                  add(col, pill("Back", false) { screen = 0; render(false) }, 0)
+                  val top = card(col)
+                  top.addView(txt(groups.size.toString() + " duplicate groups", 22f, th.tx, true))
+                  val info = txt("", 14f, th.sub, false)
+                  top.addView(info)
+                  val trash = pill("", true) { trashSelected() }
+                  add(top, trash, 12)
+                  val r2 = LinearLayout(this)
+                  val b1 = pill("Smart select", false) { smartSelect(); render(true) }
+                  val b2 = pill("Clear", false) { sel.clear(); render(true) }
+                  val l1 = LinearLayout.LayoutParams(0, -2, 1f)
+                  l1.rightMargin = dp(8)
+                  r2.addView(b1, l1)
+                  r2.addView(b2, LinearLayout.LayoutParams(0, -2, 1f))
+                  add(top, r2, 8)
+                  updSel = {
+                      var s = 0L
+                      for (m in sel) s += m.size
+                      info.text = sel.size.toString() + " selected, " + mb(s) + " can be freed"
+                      trash.text = "Move " + sel.size + " to trash"
+                  }
+                  updSel?.invoke()
+                  var gi = 0
+                  for (g in groups.take(200)) {
+                      gi++
+                      val c = card(col)
+                      c.addView(txt("Group " + gi + "  -  " + g.type, 16f, th.tx, true))
+                      if (g.note.isNotEmpty()) c.addView(txt(g.note, 13f, th.sub, false))
+                      val k = if (g.auto) keeper(g.items) else null
+                      for (m in g.items) {
+                          val row = LinearLayout(this)
+                          row.setPadding(0, dp(10), 0, dp(4))
+                          val iv = ImageView(this)
+                          iv.scaleType = ImageView.ScaleType.CENTER_CROP
+                          iv.background = bgd(adj(th.tx, 0.10f), 12, 0)
+                          iv.clipToOutline = true
+                          iv.setOnClickListener { preview(m) }
+                          row.addView(iv, LinearLayout.LayoutParams(dp(92), dp(92)))
+                          val side = vbox()
+                          side.setPadding(dp(12), 0, 0, 0)
+                          side.addView(txt(describe(m) + (if (m === k) "\nSuggested to keep" else ""), 12f, th.tx, false))
+                          val cb = CheckBox(this)
+                          cb.buttonTintList = ColorStateList.valueOf(ac)
+                          cb.setTextColor(th.tx)
+                          if (m.mediaUri == null) {
+                              cb.text = "Can't be removed from here"
+                              cb.isEnabled = false
+                          } else {
+                              cb.text = "Move to trash"
+                              cb.isChecked = sel.contains(m)
+                              cb.setOnCheckedChangeListener { _, v ->
+                                  if (v) sel.add(m) else sel.remove(m)
+                                  updSel?.invoke()
+                              }
+                          }
+                          side.addView(cb)
+                          row.addView(side, LinearLayout.LayoutParams(0, -2, 1f))
+                          c.addView(row)
+                          thumbs.execute {
+                              val bm = thumb(m)
+                              if (bm != null) runOnUiThread { iv.setImageBitmap(bm) }
+                          }
+                      }
+                  }
+                  if (groups.size > 200) col.addView(txt("Showing the 200 groups with the most space to save.", 13f, th.sub, false), lp(12))
+              }
+
+              private fun smartSelect() {
+                  sel.clear()
+                  for (g in groups) if (g.auto) {
+                      val k = keeper(g.items)
+                      for (m in g.items) if (m !== k && m.mediaUri != null) sel.add(m)
+                  }
+              }
+
+              private fun preview(m: Item) {
+                  try {
+                      val i = Intent(Intent.ACTION_VIEW)
+                      i.setDataAndType(m.uri, if (m.mime.isEmpty()) (if (m.video) "video/*" else "image/*") else m.mime)
+                      i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                      startActivity(i)
+                  } catch (e: Throwable) {
+                      toast("No app found to open this file")
+                  }
+              }
+
+              private fun thumb(m: Item): Bitmap? {
+                  try { return contentResolver.loadThumbnail(m.uri, Size(240, 240), null) } catch (e: Throwable) {}
+                  try {
+                      if (m.video) {
+                          val mr = MediaMetadataRetriever()
+                          try {
+                              mr.setDataSource(this, m.uri)
+                              return mr.getFrameAtTime(0)
+                          } finally {
+                              try { mr.release() } catch (e: Throwable) {}
+                          }
+                      }
+                      return ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, m.uri)) { d, _, _ -> d.setTargetSampleSize(4) }
+                  } catch (e: Throwable) {}
+                  return null
+              }
+
+              private fun mb(b: Long): String = if (b >= 1048576L) String.format("%.1f MB", b / 1048576.0) else String.format("%d KB", b / 1024)
+
+              private fun describe(m: Item): String {
+                  val sb = StringBuilder(m.name)
+                  sb.append("\n").append(mb(m.size))
+                  if (m.w > 0 && m.h > 0) sb.append("  -  ").append(m.w).append("x").append(m.h)
+                  if (m.video && m.dur > 0) sb.append("  -  ").append(mmss(m.dur / 1000.0))
+                  val t = m.mime.substringAfter("/", "").uppercase()
+                  if (t.isNotEmpty()) sb.append("  -  ").append(t)
+                  return sb.toString()
+              }
+
+              private fun keeper(g: List<Item>): Item {
+                  val r = prefs.getInt("keep", 0)
+                  var b = g[0]
+                  for (m in g) {
+                      if (r == 1) {
+                          if (b.mod == 0L || (m.mod > 0L && m.mod < b.mod)) b = m
+                      } else if (r == 2) {
+                          if (m.mod > b.mod) b = m
+                      } else {
+                          val pm = m.w.toLong() * m.h
+                          val pb = b.w.toLong() * b.h
+                          if (pm > pb || (pm == pb && m.size > b.size)) b = m
+                      }
+                  }
                   return b
               }
 
-              private fun start(job: () -> Unit) {
-                  if (busy) return
-                  busy = true
-                  runOnUiThread { out.removeAllViews(); checks.clear() }
-                  Thread {
-                      try {
-                          job()
-                      } catch (e: Throwable) {
-                          runOnUiThread { status.text = "Error: " + e }
-                      }
-                      busy = false
-                  }.start()
+              // ---------- picking, permissions, trash ----------
+              private fun pick() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "*/*"
+                  i.putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                  startActivityForResult(i, 43)
               }
 
-              private fun prog(d: Int, t: Int, msg: String) {
-                  runOnUiThread {
-                      bar.max = if (t < 1) 1 else t
-                      bar.progress = d
-                      status.text = msg
+              private fun trashSelected() {
+                  val uris = ArrayList<Uri>()
+                  for (m in sel) {
+                      val u = m.mediaUri
+                      if (u != null) uris.add(u)
+                  }
+                  if (uris.isEmpty()) { toast("Nothing selected"); return }
+                  try {
+                      val pi = MediaStore.createTrashRequest(contentResolver, uris, true)
+                      startIntentSenderForResult(pi.intentSender, 42, null, 0, 0, 0)
+                  } catch (e: Throwable) {
+                      toast("Android did not allow this. Delete them in your gallery instead.")
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 43 && resultCode == RESULT_OK && data != null) {
+                      val us = ArrayList<Uri>()
+                      val cd = data.clipData
+                      if (cd != null) {
+                          for (i in 0 until cd.itemCount) us.add(cd.getItemAt(i).uri)
+                      } else {
+                          val d = data.data
+                          if (d != null) us.add(d)
+                      }
+                      if (us.size > 1) startScan(us) else toast("Pick at least 2 files to compare")
+                  }
+                  if (requestCode == 42) {
+                      if (resultCode == RESULT_OK) {
+                          val gone = HashSet<Item>()
+                          for (m in sel) if (m.mediaUri != null) gone.add(m)
+                          val ng = ArrayList<Group>()
+                          for (g in groups) {
+                              val left = g.items.filter { x -> x !in gone }
+                              if (left.size > 1) ng.add(Group(g.type, left, g.note, g.auto))
+                          }
+                          groups = ng
+                          sel.removeAll(gone)
+                          msg = "Moved " + gone.size + " items to trash."
+                          if (groups.isEmpty()) screen = 0
+                          render(false)
+                      } else {
+                          toast("Cancelled. Nothing was changed.")
+                      }
                   }
               }
 
@@ -198,11 +641,86 @@ jobs:
                       arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
                   else arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
                   if (p.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) return true
-                  runOnUiThread {
-                      requestPermissions(p, 7)
-                      status.text = "Allow access to all photos and videos, then tap the scan button again."
-                  }
+                  requestPermissions(p, 7)
+                  toast("Allow access to all photos and videos, then tap Scan again")
                   return false
+              }
+
+              // ---------- scanning ----------
+              private fun startScan(picked: List<Uri>?) {
+                  if (scanning) return
+                  if (picked == null && !perm()) return
+                  scanning = true
+                  cancel = false
+                  groups = ArrayList()
+                  sel.clear()
+                  msg = "Starting..."
+                  pct = 0
+                  pmax = 1
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  screen = 0
+                  render(false)
+                  Thread {
+                      try {
+                          doScan(picked)
+                      } catch (e: Throwable) {
+                          msg = "Something went wrong: " + e.javaClass.simpleName + " " + (e.message ?: "")
+                          groups = ArrayList()
+                      }
+                      scanning = false
+                      runOnUiThread {
+                          window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                          screen = if (groups.isNotEmpty()) 2 else 0
+                          render(false)
+                      }
+                  }.start()
+              }
+
+              private fun prog(d: Int, t: Int, m: String) {
+                  msg = m
+                  pct = d
+                  pmax = if (t < 1) 1 else t
+                  runOnUiThread {
+                      statusTv?.text = msg
+                      barPb?.max = pmax
+                      barPb?.progress = pct
+                  }
+              }
+
+              private fun <T> par(list: List<T>, cap: Int, fn: (T) -> Unit) {
+                  val set = prefs.getInt("thr", 0)
+                  val n = maxOf(1, minOf(cap, if (set > 0) set else maxOf(2, Runtime.getRuntime().availableProcessors() - 1)))
+                  val idx = AtomicInteger(0)
+                  val ws = ArrayList<Thread>()
+                  for (i in 0 until n) {
+                      val t = Thread {
+                          while (!cancel) {
+                              val k = idx.getAndIncrement()
+                              if (k >= list.size) break
+                              try { fn(list[k]) } catch (e: Throwable) {}
+                          }
+                      }
+                      ws.add(t)
+                      t.start()
+                  }
+                  for (t in ws) t.join()
+              }
+
+              private fun doScan(picked: List<Uri>?) {
+                  val items = if (picked == null) loadAll() else loadPicked(picked)
+                  prog(0, 1, "Found " + items.size + " files")
+                  val photos = ArrayList<Item>()
+                  val vids = ArrayList<Item>()
+                  for (m in items) if (m.video) vids.add(m) else photos.add(m)
+                  val out = ArrayList<Group>()
+                  if (photos.size > 1) scanPhotos(photos, out)
+                  if (!cancel && vids.size > 1) scanVideos(vids, out)
+                  if (cancel) { groups = ArrayList(); msg = "Cancelled."; return }
+                  val sorted = out.sortedByDescending { g -> saving(g) }
+                  groups = sorted
+                  sel.clear()
+                  smartSelect()
+                  msg = if (sorted.isEmpty()) "Done. No duplicates found among " + items.size + " files." else ""
               }
 
               private fun query(video: Boolean): List<Item> {
@@ -214,17 +732,80 @@ jobs:
                   cols.add(MediaStore.MediaColumns.WIDTH)
                   cols.add(MediaStore.MediaColumns.HEIGHT)
                   cols.add(MediaStore.MediaColumns.DATE_MODIFIED)
+                  cols.add(MediaStore.MediaColumns.MIME_TYPE)
                   if (video) cols.add(MediaStore.MediaColumns.DURATION)
                   val res = ArrayList<Item>()
                   val c = contentResolver.query(base, cols.toTypedArray(), null, null, null)
                   if (c != null) {
                       c.use {
                           while (it.moveToNext()) {
-                              val id = it.getLong(0)
-                              val dur = if (video) it.getLong(6) else 0L
-                              res.add(Item(ContentUris.withAppendedId(base, id), it.getString(1) ?: "?", it.getLong(2), it.getInt(3), it.getInt(4), it.getLong(5), dur, video))
+                              val u = ContentUris.withAppendedId(base, it.getLong(0))
+                              val dur = if (video) it.getLong(7) else 0L
+                              res.add(Item(u, it.getString(1) ?: "?", it.getLong(2), it.getInt(3), it.getInt(4), it.getLong(5), dur, video, it.getString(6) ?: "", u))
                           }
                       }
+                  }
+                  return res
+              }
+
+              private fun loadAll(): List<Item> {
+                  val res = ArrayList<Item>()
+                  val minB = prefs.getInt("minkb", 0) * 1024L
+                  val gif = prefs.getBoolean("gif", true)
+                  if (prefs.getBoolean("photos", true)) for (m in query(false)) if (m.size >= minB && (gif || m.mime != "image/gif")) res.add(m)
+                  if (prefs.getBoolean("videos", true)) for (m in query(true)) if (m.size >= minB) res.add(m)
+                  return res
+              }
+
+              private fun toMedia(u: Uri, video: Boolean): Uri? {
+                  try {
+                      if (u.authority == MediaStore.AUTHORITY) return u
+                      if (Build.VERSION.SDK_INT >= 31) {
+                          val r = MediaStore.getMediaUri(this, u)
+                          if (r != null) return r
+                      }
+                      if (u.authority == "com.android.providers.media.documents") {
+                          val id = DocumentsContract.getDocumentId(u).substringAfter(":").toLong()
+                          return ContentUris.withAppendedId(if (video) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                      }
+                  } catch (e: Throwable) {}
+                  return null
+              }
+
+              private fun vidInfo(m: Item) {
+                  val mr = MediaMetadataRetriever()
+                  try {
+                      mr.setDataSource(this, m.uri)
+                      m.dur = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                      m.w = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                      m.h = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                  } catch (e: Throwable) {
+                  } finally {
+                      try { mr.release() } catch (e: Throwable) {}
+                  }
+              }
+
+              private fun loadPicked(us: List<Uri>): List<Item> {
+                  val res = ArrayList<Item>()
+                  var n = 0
+                  for (u in us) {
+                      var name = "file"
+                      var size = 0L
+                      try {
+                          contentResolver.query(u, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use {
+                              if (it.moveToFirst()) {
+                                  name = it.getString(0) ?: "file"
+                                  size = it.getLong(1)
+                              }
+                          }
+                      } catch (e: Throwable) {}
+                      val mime = contentResolver.getType(u) ?: ""
+                      val video = mime.startsWith("video/")
+                      val m = Item(u, name, size, 0, 0, 0L, 0L, video, mime, toMedia(u, video))
+                      if (video) vidInfo(m)
+                      res.add(m)
+                      n++
+                      prog(n, us.size, "Reading picked files... $n/" + us.size)
                   }
                   return res
               }
@@ -299,28 +880,37 @@ jobs:
               }
 
               private fun imgFp(m: Item): Fp? {
+                  var bmp: Bitmap? = null
                   try {
-                      val bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, m.uri)) { dec, _, _ ->
+                      bmp = ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, m.uri)) { dec, info, _ ->
+                          if (m.w <= 0) { m.w = info.size.width; m.h = info.size.height }
                           dec.setTargetSize(64, 64)
                           dec.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
                       }
-                      return hashBmp(bmp, false)
-                  } catch (e: Throwable) {
-                      return null
+                  } catch (e: Throwable) {}
+                  if (bmp == null) {
+                      try {
+                          val o = BitmapFactory.Options()
+                          o.inSampleSize = 8
+                          val ins = contentResolver.openInputStream(m.uri)
+                          if (ins != null) ins.use { s -> bmp = BitmapFactory.decodeStream(s, null, o) }
+                      } catch (e: Throwable) {}
                   }
+                  val b = bmp ?: return null
+                  return hashBmp(b, true)
               }
 
-              private fun vidFrames(m: Item, step: Int, onp: (Double) -> Unit): List<Fp?>? {
+              private fun vidFrames(m: Item, step: Int): List<Fp?>? {
                   val mr = MediaMetadataRetriever()
                   try {
                       mr.setDataSource(this, m.uri)
                       val n = Math.ceil(m.dur / 1000.0 / step).toInt()
                       val res = ArrayList<Fp?>()
                       for (k in 0 until n) {
+                          if (cancel) return null
                           val t = minOf(m.dur * 1000L - 100000L, ((step / 2.0 + k * step) * 1000000.0).toLong())
                           val bmp = mr.getScaledFrameAtTime(maxOf(0L, t), MediaMetadataRetriever.OPTION_CLOSEST, 64, 64)
                           res.add(if (bmp == null) null else hashBmp(bmp, true))
-                          if (k % 3 == 0) onp(k.toDouble() / n)
                       }
                       return res
                   } catch (e: Throwable) {
@@ -363,32 +953,22 @@ jobs:
               private fun findExact(items: List<Item>): List<List<Item>> {
                   val bySize = HashMap<Long, MutableList<Item>>()
                   for (m in items) if (m.size > 0) bySize.getOrPut(m.size) { ArrayList() }.add(m)
-                  var total = 0
-                  for (g in bySize.values) if (g.size > 1) total += g.size
-                  var done = 0
+                  val cand = ArrayList<Item>()
+                  for (g in bySize.values) if (g.size > 1) cand.addAll(g)
+                  val done = AtomicInteger(0)
+                  par(cand, 4) { m ->
+                      m.sha = sha(m.uri)
+                      val d = done.incrementAndGet()
+                      if (d % 3 == 0) prog(d, cand.size, "Checking exact copies... $d/" + cand.size)
+                  }
                   val byHash = HashMap<String, MutableList<Item>>()
-                  for (g in bySize.values) {
-                      if (g.size < 2) continue
-                      for (m in g) {
-                          val h = sha(m.uri)
-                          if (h != null) byHash.getOrPut(h) { ArrayList() }.add(m)
-                          done++
-                          prog(done, total, "Checking exact copies... $done/$total")
-                      }
+                  for (m in cand) {
+                      val h = m.sha
+                      if (h != null) byHash.getOrPut(h + ":" + m.size) { ArrayList() }.add(m)
                   }
                   val res = ArrayList<List<Item>>()
                   for (g in byHash.values) if (g.size > 1) res.add(g)
                   return res
-              }
-
-              private fun best(g: List<Item>): Item {
-                  var b = g[0]
-                  for (m in g) {
-                      val pm = m.w.toLong() * m.h
-                      val pb = b.w.toLong() * b.h
-                      if (pm > pb || (pm == pb && (m.size > b.size || (m.size == b.size && m.mod < b.mod)))) b = m
-                  }
-                  return b
               }
 
               private fun sameShape(a: Item, b: Item): Boolean {
@@ -398,10 +978,7 @@ jobs:
                   return Math.abs(ra - rb) / maxOf(ra, rb) <= 0.05
               }
 
-              private fun scanPhotos() {
-                  if (!perm()) return
-                  val items = query(false)
-                  prog(0, 1, "Found " + items.size + " photos")
+              private fun scanPhotos(items: List<Item>, out: ArrayList<Group>) {
                   val ex = findExact(items)
                   val twins = HashMap<Item, List<Item>>()
                   val skip = HashSet<Item>()
@@ -409,174 +986,83 @@ jobs:
                       twins[g[0]] = g
                       for (i in 1 until g.size) skip.add(g[i])
                   }
-                  val reps = items.filter { it !in skip }
-                  var n = 0
-                  for (m in reps) {
-                      m.fp = imgFp(m)
-                      n++
-                      if (n % 10 == 0) prog(n, reps.size, "Comparing photos... $n/" + reps.size)
-                  }
-                  val taken = HashSet<Item>()
-                  val groups = ArrayList<Group>()
                   val inNear = HashSet<Item>()
-                  for (i in reps.indices) {
-                      val a = reps[i]
-                      val fa = a.fp
-                      if (fa == null || a in taken) continue
-                      val g = ArrayList<Item>()
-                      g.add(a)
-                      for (j in i + 1 until reps.size) {
-                          val b = reps[j]
-                          val fb = b.fp
-                          if (fb != null && b !in taken && sameShape(a, b) &&
-                              java.lang.Long.bitCount(fa.d xor fb.d) <= 5 && java.lang.Long.bitCount(fa.a xor fb.a) <= 9) g.add(b)
+                  if (!cancel && !prefs.getBoolean("exact", false)) {
+                      val reps = items.filter { it !in skip }
+                      val n = AtomicInteger(0)
+                      par(reps, 8) { m ->
+                          m.fp = imgFp(m)
+                          val d = n.incrementAndGet()
+                          if (d % 10 == 0) prog(d, reps.size, "Comparing photos... $d/" + reps.size)
                       }
-                      if (g.size > 1) {
-                          taken.addAll(g)
-                          val full = ArrayList<Item>()
-                          for (m in g) full.addAll(twins[m] ?: listOf(m))
-                          inNear.addAll(full)
-                          groups.add(Group("Look-alike", full, "", true))
+                      val t = prefs.getInt("sens", 5)
+                      val taken = HashSet<Item>()
+                      for (i in reps.indices) {
+                          if (cancel) return
+                          val a = reps[i]
+                          val fa = a.fp
+                          if (fa == null || a in taken) continue
+                          val g = ArrayList<Item>()
+                          g.add(a)
+                          for (j in i + 1 until reps.size) {
+                              val b = reps[j]
+                              val fb = b.fp
+                              if (fb != null && b !in taken && sameShape(a, b) &&
+                                  java.lang.Long.bitCount(fa.d xor fb.d) <= t && java.lang.Long.bitCount(fa.a xor fb.a) <= t + 4) g.add(b)
+                          }
+                          if (g.size > 1) {
+                              taken.addAll(g)
+                              val full = ArrayList<Item>()
+                              for (m in g) full.addAll(twins[m] ?: listOf(m))
+                              inNear.addAll(full)
+                              out.add(Group("Look-alike", full, "", true))
+                          }
                       }
                   }
-                  for (g in ex) if (g[0] !in inNear) groups.add(Group("Exact copy", g, "", true))
-                  showGroups(groups)
+                  for (g in ex) if (g[0] !in inNear) out.add(Group("Exact copy", g, "", true))
               }
 
-              private fun scanVideos(shared: Boolean) {
-                  if (!perm()) return
-                  val items = query(true)
-                  prog(0, 1, "Found " + items.size + " videos")
+              private fun scanVideos(items: List<Item>, out: ArrayList<Group>) {
                   val ex = findExact(items)
-                  val groups = ArrayList<Group>()
-                  for (g in ex) groups.add(Group("Exact copy", g, "", true))
-                  if (shared) {
-                      val skip = HashSet<Item>()
-                      for (g in ex) for (i in 1 until g.size) skip.add(g[i])
-                      val reps = items.filter { it !in skip && it.dur > 3000 }
-                      if (reps.size > 1) {
-                          var md = 0L
-                          for (m in reps) if (m.dur > md) md = m.dur
-                          val step = maxOf(1, Math.ceil(md / 1000.0 / 600.0).toInt())
-                          var k = 0
-                          for (m in reps) {
-                              k++
-                              val kk = k
-                              m.fr = vidFrames(m, step) { p -> prog(kk - 1, reps.size, "Sampling video $kk/" + reps.size + " (" + (p * 100).toInt() + "%)") }
-                          }
-                          val ok = reps.filter { m -> (m.fr?.count { f -> f != null } ?: 0) >= 3 }
-                          prog(0, 1, "Comparing " + ok.size + " videos...")
-                          for (i in ok.indices) for (j in i + 1 until ok.size) {
-                              var a = ok[i]
-                              var b = ok[j]
-                              if (b.dur > a.dur) { val t = a; a = b; b = t }
-                              val r = sharedRun(a.fr!!, b.fr!!, 5)
-                              val need = maxOf(3, Math.ceil(minOf(20.0, 0.6 * b.dur / 1000.0) / step).toInt())
-                              if (r.n >= need) {
-                                  val e1 = minOf(a.dur / 1000.0, (r.a1 + 1) * step.toDouble())
-                                  val e2 = minOf(b.dur / 1000.0, (r.b1 + 1) * step.toDouble())
-                                  val len = minOf(e1 - r.a0 * step, e2 - r.b0 * step)
-                                  val note = "Matching footage about " + mmss(len) + ". Longer video " + mmss(r.a0 * step.toDouble()) + "-" + mmss(e1) +
-                                      ", shorter video " + mmss(r.b0 * step.toDouble()) + "-" + mmss(e2) + ". Check before trashing."
-                                  groups.add(Group("Shared footage", listOf(a, b), note, false))
-                              }
-                          }
+                  for (g in ex) out.add(Group("Exact copy", g, "", true))
+                  if (cancel || prefs.getBoolean("exact", false) || !prefs.getBoolean("shared", false)) return
+                  val skip = HashSet<Item>()
+                  for (g in ex) for (i in 1 until g.size) skip.add(g[i])
+                  val reps = items.filter { it !in skip && it.dur > 3000 }
+                  if (reps.size < 2) return
+                  var md = 0L
+                  for (m in reps) if (m.dur > md) md = m.dur
+                  val step = maxOf(prefs.getInt("vstep", 2), Math.ceil(md / 1000.0 / 600.0).toInt())
+                  val done = AtomicInteger(0)
+                  par(reps, 3) { m ->
+                      m.fr = vidFrames(m, step)
+                      val d = done.incrementAndGet()
+                      prog(d, reps.size, "Sampling videos... $d/" + reps.size)
+                  }
+                  if (cancel) return
+                  val ok = reps.filter { m -> (m.fr?.count { f -> f != null } ?: 0) >= 3 }
+                  prog(0, 1, "Comparing " + ok.size + " videos...")
+                  val t = prefs.getInt("sens", 5)
+                  for (i in ok.indices) for (j in i + 1 until ok.size) {
+                      var a = ok[i]
+                      var b = ok[j]
+                      if (b.dur > a.dur) { val x = a; a = b; b = x }
+                      val r = sharedRun(a.fr!!, b.fr!!, t)
+                      val need = maxOf(3, Math.ceil(minOf(20.0, 0.6 * b.dur / 1000.0) / step).toInt())
+                      if (r.n >= need) {
+                          val e1 = minOf(a.dur / 1000.0, (r.a1 + 1) * step.toDouble())
+                          val e2 = minOf(b.dur / 1000.0, (r.b1 + 1) * step.toDouble())
+                          val len = minOf(e1 - r.a0 * step, e2 - r.b0 * step)
+                          val note = "Matching footage about " + mmss(len) + ". Longer video " + mmss(r.a0 * step.toDouble()) + "-" + mmss(e1) +
+                              ", shorter video " + mmss(r.b0 * step.toDouble()) + "-" + mmss(e2) + ". Check before trashing."
+                          out.add(Group("Shared footage", listOf(a, b), note, false))
                       }
                   }
-                  showGroups(groups)
               }
 
               private fun mmss(s: Double): String {
                   val t = s.toInt()
                   return String.format("%d:%02d", t / 60, t % 60)
-              }
-
-              private fun describe(m: Item): String {
-                  val sb = StringBuilder(m.name)
-                  sb.append("\n").append(String.format("%.2f MB", m.size / 1048576.0))
-                  if (m.w > 0) sb.append(" - ").append(m.w).append("x").append(m.h)
-                  if (m.video) sb.append(" - ").append(mmss(m.dur / 1000.0))
-                  return sb.toString()
-              }
-
-              private fun showGroups(groups: List<Group>) {
-                  runOnUiThread {
-                      out.removeAllViews()
-                      checks.clear()
-                      bar.progress = bar.max
-                      if (groups.isEmpty()) {
-                          status.text = "Done. No duplicates found."
-                      } else {
-                          status.text = "Done. " + groups.size + " groups found. Untick anything you want to keep."
-                          val del = Button(this)
-                          del.text = "Move selected to trash"
-                          del.setOnClickListener { trashSelected() }
-                          out.addView(del)
-                          var gi = 0
-                          for (g in groups.take(300)) {
-                              gi++
-                              val card = LinearLayout(this)
-                              card.orientation = LinearLayout.VERTICAL
-                              card.setPadding(dp(4), dp(14), dp(4), dp(10))
-                              val h = TextView(this)
-                              h.text = "Group $gi - " + g.type
-                              h.textSize = 17f
-                              card.addView(h)
-                              if (g.note.isNotEmpty()) {
-                                  val nt = TextView(this)
-                                  nt.text = g.note
-                                  card.addView(nt)
-                              }
-                              val keep = if (g.auto) best(g.items) else null
-                              for (m in g.items) {
-                                  val row = LinearLayout(this)
-                                  row.orientation = LinearLayout.HORIZONTAL
-                                  row.setPadding(0, dp(8), 0, dp(8))
-                                  val iv = ImageView(this)
-                                  iv.scaleType = ImageView.ScaleType.CENTER_CROP
-                                  row.addView(iv, LinearLayout.LayoutParams(dp(96), dp(96)))
-                                  val side = LinearLayout(this)
-                                  side.orientation = LinearLayout.VERTICAL
-                                  side.setPadding(dp(10), 0, 0, 0)
-                                  val t = TextView(this)
-                                  t.text = describe(m) + (if (m === keep) "\nSuggested to keep" else "")
-                                  val cb = CheckBox(this)
-                                  cb.text = "Move to trash"
-                                  cb.isChecked = g.auto && m !== keep
-                                  side.addView(t)
-                                  side.addView(cb)
-                                  row.addView(side, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                                  card.addView(row)
-                                  checks.add(Pair(cb, m))
-                                  thumbs.execute {
-                                      try {
-                                          val bm = contentResolver.loadThumbnail(m.uri, Size(192, 192), null)
-                                          runOnUiThread { iv.setImageBitmap(bm) }
-                                      } catch (e: Throwable) {}
-                                  }
-                              }
-                              out.addView(card)
-                          }
-                      }
-                  }
-              }
-
-              private fun trashSelected() {
-                  val uris = ArrayList<Uri>()
-                  for (p in checks) if (p.first.isChecked) uris.add(p.second.uri)
-                  if (uris.isEmpty()) {
-                      Toast.makeText(this, "Nothing selected", Toast.LENGTH_SHORT).show()
-                      return
-                  }
-                  val pi = MediaStore.createTrashRequest(contentResolver, uris, true)
-                  startIntentSenderForResult(pi.intentSender, 42, null, 0, 0, 0)
-              }
-
-              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-                  super.onActivityResult(requestCode, resultCode, data)
-                  if (requestCode == 42) {
-                      status.text = if (resultCode == RESULT_OK) "Moved to trash. Scan again to refresh the list." else "Cancelled. Nothing was changed."
-                  }
               }
           }
           EOF

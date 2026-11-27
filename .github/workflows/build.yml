@@ -275,7 +275,31 @@ jobs:
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   prefs = getSharedPreferences("dupe", MODE_PRIVATE)
-                  render(false)
+                  val old = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      try { prefs.edit().putString("crash", android.util.Log.getStackTraceString(e)).commit() } catch (x: Throwable) {}
+                      if (old != null) old.uncaughtException(t, e)
+                  }
+                  val crash = prefs.getString("crash", null)
+                  if (crash != null) { showCrash(crash); return }
+                  try { render(false) } catch (e: Throwable) { showCrash(android.util.Log.getStackTraceString(e)) }
+              }
+
+              private fun showCrash(trace: String) {
+                  prefs.edit().remove("crash").commit()
+                  val col = vbox()
+                  col.setPadding(dp(16), dp(32), dp(16), dp(16))
+                  col.addView(txt("Dupe Finder hit a problem", 20f, Color.BLACK, true))
+                  col.addView(txt("Please screenshot this and send it to Claude. Close and reopen the app afterwards.", 14f, Color.DKGRAY, false))
+                  val t = TextView(this)
+                  t.text = trace.take(1800)
+                  t.textSize = 11f
+                  t.setTextColor(Color.BLACK)
+                  col.addView(t)
+                  val sc = ScrollView(this)
+                  sc.setBackgroundColor(Color.WHITE)
+                  sc.addView(col)
+                  setContentView(sc)
               }
               override fun onConfigurationChanged(newConfig: Configuration) {
                   super.onConfigurationChanged(newConfig)
@@ -292,11 +316,6 @@ jobs:
                   ac = if (h < 0) th.ac else hsv(h)
                   window.statusBarColor = th.bg
                   window.navigationBarColor = th.bg
-                  val ctl = window.insetsController
-                  if (ctl != null) {
-                      val m = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-                      ctl.setSystemBarsAppearance(if (th.dark) 0 else m, m)
-                  }
                   if (prefs.getBoolean("secure", false)) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                   else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
                   val y = if (keep) (sv?.scrollY ?: 0) else 0
@@ -315,6 +334,13 @@ jobs:
                       else -> results(col)
                   }
                   setContentView(s)
+                  try {
+                      val ctl = window.insetsController
+                      if (ctl != null) {
+                          val m = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                          ctl.setSystemBarsAppearance(if (th.dark) 0 else m, m)
+                      }
+                  } catch (e: Throwable) {}
                   s.post { s.scrollTo(0, y) }
               }
 
